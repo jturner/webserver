@@ -1,44 +1,134 @@
-use tokio::{io::BufStream, net::TcpListener};
-use tracing::info;
+use clap::Parser;
+use std::{net::SocketAddr, path::PathBuf};
+use tokio::{
+    io::{AsyncWrite, BufStream},
+    net::{TcpListener, TcpStream},
+    signal,
+};
+use tokio_util::sync::CancellationToken;
+use tracing::{error, info};
 
+mod handler;
 mod req;
 mod resp;
 
-static DEFAULT_PORT: &str = "8080";
+#[derive(Parser, Debug)]
+pub struct Args {
+    #[arg(short, long, default_value_t = 8080)]
+    pub port: u16,
+    #[arg(short, long)]
+    pub root: Option<PathBuf>,
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
-    let port: u16 = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| DEFAULT_PORT.to_string())
-        .parse()?;
+    let args = Args::parse();
+    let port = args.port;
+    let handler = args
+        .root
+        .map(handler::StaticFileHandler::with_root)
+        .unwrap_or_else(|| {
+            handler::StaticFileHandler::in_current_dir().expect("failed to get current dir")
+        });
 
     let listener = TcpListener::bind(format!("0.0.0.0:{port}")).await.unwrap();
 
     info!("listening on : {}", listener.local_addr()?);
 
+    let cancel_token = CancellationToken::new();
+
+    tokio::spawn({
+        let cancel_token = cancel_token.clone();
+        async move {
+            if let Ok(()) = signal::ctrl_c().await {
+                info!("received Ctrl-C, shutting down");
+                cancel_token.cancel();
+            }
+        }
+    });
+
+    let mut tasks = Vec::new();
+
     loop {
-        let (stream, addr) = listener.accept().await?;
-        let mut stream = BufStream::new(stream);
+        let cancel_token = cancel_token.clone();
 
-        tokio::spawn(async move {
-            info!(?addr, "new connection");
+        tokio::select! {
+            Ok((stream, addr)) = listener.accept() => {
+                let handler = handler.clone();
+                let client_task = tokio::spawn(async move {
+                   if let Err(e) = handle_client(cancel_token, stream, addr, &handler).await {
+                       error!(?e, "failed to handle client");
+                   }
+                });
+                tasks.push(client_task);
+            },
+            _ = cancel_token.cancelled() => {
+                info!("stop listening");
+                break;
+            }
+        }
+    }
 
-            match req::parse_request(&mut stream).await {
-                Ok(req) => info!(?req, "incoming request"),
-                Err(e) => {
-                    info!(?e, "failed to parse request");
+    futures::future::join_all(tasks).await;
+
+    Ok(())
+}
+
+async fn handle_client(
+    cancel_token: CancellationToken,
+    stream: TcpStream,
+    addr: SocketAddr,
+    handler: &handler::StaticFileHandler,
+) -> anyhow::Result<()> {
+    let mut stream = BufStream::new(stream);
+
+    info!(?addr, "new connection");
+
+    loop {
+        tokio::select! {
+            req = req::parse_request(&mut stream) => {
+                match req {
+                    Ok(req) => {
+                        info!(?req, "incoming request");
+                        let close_conn = handle_req(req, &handler, &mut stream).await?;
+                        if close_conn {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        error!(?e, "failed to parse request");
+                        break;
+                    }
                 }
             }
-
-            let resp = resp::Response::from_html(
-                resp::Status::NotFound,
-                include_str!("../static/404.html"),
-            );
-
-            resp.write(&mut stream).await.unwrap();
-        });
+            _ = cancel_token.cancelled() => {
+                info!(?addr, "closing connection");
+                break;
+            }
+        }
     }
+
+    Ok(())
+}
+
+async fn handle_req<S: AsyncWrite + Unpin>(
+    req: req::Request,
+    handler: &handler::StaticFileHandler,
+    stream: &mut S,
+) -> anyhow::Result<bool> {
+    let close_connection = req.headers.get("Connection") == Some(&"close".to_string());
+
+    match handler.handle(req).await {
+        Ok(resp) => {
+            resp.write(stream).await.unwrap();
+        }
+        Err(e) => {
+            error!(?e, "failed to handle request");
+            return Ok(false);
+        }
+    };
+
+    Ok(close_connection)
 }
