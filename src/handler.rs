@@ -19,13 +19,23 @@ impl StaticFileHandler {
     }
 
     pub async fn handle(&self, request: Request) -> anyhow::Result<Response> {
-        let path = self.root.join(request.path.strip_prefix('/').unwrap());
+        let mut path = self.root.join(request.path.strip_prefix('/').unwrap());
 
-        if !path.is_file() {
+        if !path.is_file() && !path.is_dir() {
             return Ok(Response::from_html(
                 Status::NotFound,
                 include_str!("../static/404.html"),
             ));
+        }
+
+        if !path.is_file() && path.is_dir() {
+            path = path.join("index.html");
+            if !path.is_file() {
+                return Ok(Response::from_html(
+                    Status::NotFound,
+                    include_str!("../static/404.html"),
+                ));
+            }
         }
 
         let file = tokio::fs::File::open(&path).await?;
